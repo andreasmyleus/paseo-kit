@@ -12,6 +12,9 @@ const execFileAsync = promisify(execFile);
 const SAMPLE_INTERVAL_MS = 2000;
 // Disk usage moves slowly; there is no point in asking the kernel every two seconds.
 const DISK_INTERVAL_MS = 30_000;
+// The footer reads every two seconds; with no reads for this long nobody is watching, so sampling
+// pauses instead of spawning vm_stat and sysctl forever. The next read resumes it.
+const IDLE_AFTER_MS = 60_000;
 const HISTORY_LENGTH = 90;
 // Virtual interfaces mirror traffic already counted on the physical one.
 const IGNORED_INTERFACE = /^(lo|veth|docker|br-|virbr)/;
@@ -246,6 +249,9 @@ export function startSampler(): { read(): Promise<HostStats>; stop(): void } {
   let macMemory: MemoryUsage | null = null;
   let macMemoryRead: Promise<void> | null = null;
   let memory = readMemory();
+  let lastReadAt = 0;
+  let timers: NodeJS.Timeout[] = [];
+  let firstSample: Promise<void> = Promise.resolve();
 
   // vm_stat runs as a separate process, so each tick uses the reading the previous one started.
   const refreshMacMemory = () => {
@@ -259,8 +265,17 @@ export function startSampler(): { read(): Promise<HostStats>; stop(): void } {
     return macMemoryRead;
   };
 
+  const pause = () => {
+    for (const timer of timers) clearInterval(timer);
+    timers = [];
+  };
+
   const tick = () => {
     const now = Date.now();
+    if (now - lastReadAt > IDLE_AFTER_MS) {
+      pause();
+      return;
+    }
     const cpu = readCpuTimes();
     const net = readNetworkTotals();
     const seconds = Math.max((now - previousAt) / 1000, 0.001);
@@ -298,14 +313,22 @@ export function startSampler(): { read(): Promise<HostStats>; stop(): void } {
       });
   };
 
-  // On macOS the first sample waits for vm_stat, so the history does not open with os.freemem's figure.
-  const firstSample = isMac ? refreshMacMemory().then(tick) : Promise.resolve(tick());
-  refreshDisks();
-  const timer = setInterval(tick, SAMPLE_INTERVAL_MS);
-  const diskTimer = setInterval(refreshDisks, DISK_INTERVAL_MS);
+  // History from before a pause would draw a line across the gap, so a resume starts it afresh.
+  const resume = () => {
+    history.length = 0;
+    previousCpu = readCpuTimes();
+    previousNet = readNetworkTotals();
+    previousAt = Date.now();
+    // On macOS the first sample waits for vm_stat, so the history does not open with os.freemem's figure.
+    firstSample = isMac ? refreshMacMemory().then(tick) : Promise.resolve(tick());
+    refreshDisks();
+    timers = [setInterval(tick, SAMPLE_INTERVAL_MS), setInterval(refreshDisks, DISK_INTERVAL_MS)];
+  };
 
   return {
     async read() {
+      lastReadAt = Date.now();
+      if (timers.length === 0) resume();
       await firstSample;
       const cpus = os.cpus();
       const [one = 0, five = 0, fifteen = 0] = os.loadavg();
@@ -334,8 +357,7 @@ export function startSampler(): { read(): Promise<HostStats>; stop(): void } {
       };
     },
     stop() {
-      clearInterval(timer);
-      clearInterval(diskTimer);
+      pause();
     },
   };
 }
